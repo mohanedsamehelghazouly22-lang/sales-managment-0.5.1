@@ -1,0 +1,208 @@
+name: Build Sales Manager (Android + Windows)
+
+# ازاي تشغّله:
+# 1) ضع هذا الملف في مشروعك على المسار: .github/workflows/build.yml
+# 2) من إعدادات الريبو على GitHub: Settings > Secrets and variables > Actions
+#    أضف Secret باسم SUPABASE_URL وقيمته رابط مشروع Supabase
+#    أضف Secret باسم SUPABASE_PUBLISHABLE_KEY وقيمته الـ publishable/anon key
+#    (لا تضع service_role key هنا نهائيًا)
+# 3) أي Push على main أو أي Tag يبدأ بـ v (زي v0.5.0) هيشغّل البناء تلقائيًا،
+#    أو تقدر تشغّله يدويًا من تبويب Actions زر Run workflow.
+#
+# ملاحظة: مفيش داعي تحدد مكان مشروع الفلاتر يدوي. كل Job فيه خطوة أولى
+# بتدوّر على ملف pubspec.yaml في أي مكان في الريبو وتحدد المسار تلقائيًا
+# (متغير PROJECT_DIR)، فمش هتحتاج تعدّل حاجة حتى لو غيّرت اسم المجلد
+# أو مكانه في الريبو مستقبلًا.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_CHANNEL: stable
+
+jobs:
+  analyze:
+    name: Analyze & format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: تحديد مكان مشروع الفلاتر تلقائيًا
+        run: |
+          FOUND=$(find . -maxdepth 6 -name pubspec.yaml -not -path '*/build/*' -not -path '*/.dart_tool/*' | head -n1)
+          if [ -z "$FOUND" ]; then
+            echo "::error::pubspec.yaml مش موجود في الريبو خالص — تأكد إن ملفات مشروع الفلاتر متضافة (git add) ومدفوعة (push) فعلًا."
+            exit 1
+          fi
+          DIR=$(dirname "$FOUND")
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "✓ لقيت المشروع في: $DIR"
+
+      - name: flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: تحقق من التنسيق (dart format)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: dart format --output=none --set-exit-if-changed lib
+        continue-on-error: true
+
+      - name: flutter analyze
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+  build-android:
+    name: Build Android APK
+    needs: analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: تحديد مكان مشروع الفلاتر تلقائيًا
+        run: |
+          FOUND=$(find . -maxdepth 6 -name pubspec.yaml -not -path '*/build/*' -not -path '*/.dart_tool/*' | head -n1)
+          if [ -z "$FOUND" ]; then
+            echo "::error::pubspec.yaml مش موجود في الريبو خالص."
+            exit 1
+          fi
+          DIR=$(dirname "$FOUND")
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "✓ لقيت المشروع في: $DIR"
+
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PUB_CACHE || '~/.pub-cache' }}
+          key: pub-${{ runner.os }}-${{ hashFiles(format('{0}/pubspec.yaml', env.PROJECT_DIR)) }}
+
+      - name: flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: توليد مشروع Android (لو غير موجود)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ ! -d "android" ]; then
+            flutter create . --platforms=android --project-name=sales_manager --org=com.salesmanager
+          fi
+
+      - name: تجهيز Android (صلاحية الإشعارات + صلاحية الإنترنت + desugaring)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: python3 tool/patch_android.py
+
+      - name: تحقق من وجود صلاحية INTERNET في الـ Manifest
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if ! grep -q 'android.permission.INTERNET' android/app/src/main/AndroidManifest.xml; then
+            echo "::error::صلاحية INTERNET مش موجودة في AndroidManifest.xml — التطبيق هيفشل بـ SocketException: Failed host lookup على أي اتصال شبكة في نسخة release."
+            exit 1
+          fi
+          echo "✓ صلاحية INTERNET موجودة"
+
+      - name: flutter build apk --release
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk --release \
+            --split-per-abi \
+            --dart-define=SUPABASE_URL=${{ secrets.SUPABASE_URL }} \
+            --dart-define=SUPABASE_PUBLISHABLE_KEY=${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+
+      - name: رفع ملفات APK كمخرجات
+        uses: actions/upload-artifact@v4
+        with:
+          name: sales-manager-android-apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  build-windows:
+    name: Build Windows exe
+    needs: analyze
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: تحديد مكان مشروع الفلاتر تلقائيًا
+        shell: pwsh
+        run: |
+          $found = Get-ChildItem -Path . -Filter pubspec.yaml -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\build\\' -and $_.FullName -notmatch '\\.dart_tool\\' } |
+            Select-Object -First 1
+          if (-not $found) {
+            Write-Error "pubspec.yaml مش موجود في الريبو خالص."
+            exit 1
+          }
+          $dir = Resolve-Path -Relative $found.DirectoryName
+          echo "PROJECT_DIR=$dir" >> $env:GITHUB_ENV
+          Write-Host "✓ لقيت المشروع في: $dir"
+
+      - name: Cache pub packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PUB_CACHE || '~/AppData/Local/Pub/Cache' }}
+          key: pub-${{ runner.os }}-${{ hashFiles(format('{0}/pubspec.yaml', env.PROJECT_DIR)) }}
+
+      - name: flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: توليد مشروع Windows (لو غير موجود)
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if (!(Test-Path "windows")) {
+            flutter create . --platforms=windows --project-name=sales_manager --org=com.salesmanager
+          }
+
+      - name: flutter config --enable-windows-desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: flutter build windows --release
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: >
+          flutter build windows --release
+          --dart-define=SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          --dart-define=SUPABASE_PUBLISHABLE_KEY=${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+
+      - name: ضغط مخرجات ويندوز في zip
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          Compress-Archive -Path "build/windows/x64/runner/Release/*" -DestinationPath "sales-manager-windows.zip"
+
+      - name: رفع نسخة ويندوز كمخرجات
+        uses: actions/upload-artifact@v4
+        with:
+          name: sales-manager-windows
+          path: ${{ env.PROJECT_DIR }}/sales-manager-windows.zip
+          if-no-files-found: error
+          retention-days: 30
